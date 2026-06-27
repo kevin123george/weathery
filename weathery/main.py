@@ -165,6 +165,7 @@ class SearchModal(ModalScreen):
     ListView { height: 8; background: #1e1e2e; border: solid #585b70; }
     ListItem { color: #cdd6f4; padding: 0 1; height: 1; }
     ListItem:hover { background: #313244; }
+    ListItem.--highlight { background: #45475a; color: #89b4fa; }
     #hint { color: #6c7086; margin-top: 1; }
     """
     def __init__(self):
@@ -174,9 +175,9 @@ class SearchModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
             yield Label("Search location")
-            yield Input(placeholder="City name, e.g. Paris", id="inp")
+            yield Input(placeholder="City name, e.g. Hannover", id="inp")
             yield ListView(id="results")
-            yield Label("Enter to search  •  select a result  •  Esc to cancel", id="hint")
+            yield Label("Type city + Enter to search  •  Esc to cancel", id="hint")
 
     def on_mount(self):
         self.query_one("#inp", Input).focus()
@@ -184,6 +185,7 @@ class SearchModal(ModalScreen):
     def on_input_submitted(self, e: Input.Submitted):
         q = e.value.strip()
         if not q: return
+        self.query_one("#hint").update("[#f9e2af]Searching…[/#f9e2af]")
         self.query_one("#results", ListView).clear()
         self._results = []
         threading.Thread(target=self._search, args=(q,), daemon=True).start()
@@ -195,16 +197,24 @@ class SearchModal(ModalScreen):
             self._results = []
             self.call_from_thread(self._show_error, str(exc))
             return
-        lv = self.query_one("#results", ListView)
-        self.call_from_thread(lv.clear)
-        for r in self._results:
-            self.call_from_thread(lv.append, ListItem(Label(r["name"])))
+        if not self._results:
+            self.call_from_thread(self._show_error, "No results found")
+            return
+        def _populate():
+            lv = self.query_one("#results", ListView)
+            lv.clear()
+            for r in self._results:
+                lv.append(ListItem(Label(r["name"])))
+            # Auto-focus the list so arrow keys + Enter work immediately
+            lv.focus()
+            self.query_one("#hint").update(
+                "[#a6e3a1]↑↓ navigate  •  Enter to add  •  Esc to cancel[/#a6e3a1]")
+        self.call_from_thread(_populate)
 
     def _show_error(self, msg):
-        self.query_one("#hint").update(f"[red]Error: {msg}[/red]")
+        self.query_one("#hint").update(f"[red]{msg}[/red]")
 
     def on_list_view_selected(self, e: ListView.Selected):
-        # Match selected item by reference, not by index (index can lag in textual 8)
         all_items = list(self.query_one("#results", ListView).query(ListItem))
         try:
             idx = all_items.index(e.item)
