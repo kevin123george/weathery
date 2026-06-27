@@ -200,16 +200,16 @@ class SearchModal(ModalScreen):
         if not self._results:
             self.call_from_thread(self._show_error, "No results found")
             return
-        def _populate():
-            lv = self.query_one("#results", ListView)
-            lv.clear()
-            for r in self._results:
-                lv.append(ListItem(Label(r["name"])))
-            # Auto-focus the list so arrow keys + Enter work immediately
-            lv.focus()
-            self.query_one("#hint").update(
-                "[#a6e3a1]↑↓ navigate  •  Enter to add  •  Esc to cancel[/#a6e3a1]")
-        self.call_from_thread(_populate)
+        # call_from_thread auto-awaits AwaitComplete — must call clear/append
+        # individually so textual awaits each one (wrapping in a plain function
+        # discards the coroutine and silently does nothing)
+        lv = self.query_one("#results", ListView)
+        self.call_from_thread(lv.clear)
+        for r in self._results:
+            self.call_from_thread(lv.append, ListItem(Label(r["name"])))
+        self.call_from_thread(lv.focus)
+        self.call_from_thread(self.query_one("#hint").update,
+            "[#a6e3a1]↑↓ navigate  •  Enter to add  •  Esc to cancel[/#a6e3a1]")
 
     def _show_error(self, msg):
         self.query_one("#hint").update(f"[red]{msg}[/red]")
