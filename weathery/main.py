@@ -140,7 +140,7 @@ def fetch_weather(lat, lon, tz="UTC", unit="celsius"):
             "sunrise","sunset","precipitation_sum","precipitation_probability_max",
             "wind_speed_10m_max","uv_index_max",
         ]),
-        "forecast_days": 7,
+        "forecast_days": 16,
     })
     url = f"https://api.open-meteo.com/v1/forecast?{params}"
     return _fetch(url)
@@ -280,7 +280,7 @@ class WeatherApp(App):
                         yield Static("", id="now-content")
                     with TabPane("Hourly", id="tab-hourly"):
                         yield Static("", id="hourly-area")
-                    with TabPane("7-Day", id="tab-weekly"):
+                    with TabPane("16-Day", id="tab-weekly"):
                         yield DataTable(id="weekly-tbl", zebra_stripes=True)
                     with TabPane("Details", id="tab-details"):
                         with ScrollableContainer(id="detail-sc"):
