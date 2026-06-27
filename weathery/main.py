@@ -157,27 +157,26 @@ def _plt_build():
 
 # ── Modals ─────────────────────────────────────────────────────────────────────
 class SearchModal(ModalScreen):
+    """Two-step modal: type city → Enter to search → press 1-5 to pick result."""
     CSS = """
     SearchModal { align: center middle; }
-    #box { width: 60; padding: 1 2; border: solid #89b4fa; background: #313244; }
-    Label { color: #cdd6f4; margin-bottom: 1; }
-    Input { background: #45475a; color: #cdd6f4; border: solid #585b70; margin-bottom: 1; }
-    ListView { height: 8; background: #1e1e2e; border: solid #585b70; }
-    ListItem { color: #cdd6f4; padding: 0 1; height: 1; }
-    ListItem:hover { background: #313244; }
-    ListItem.--highlight { background: #45475a; color: #89b4fa; }
-    #hint { color: #6c7086; margin-top: 1; }
+    #box { width: 64; padding: 1 2; border: solid #89b4fa; background: #313244; }
+    #title  { color: #89b4fa; margin-bottom: 1; }
+    Input   { background: #45475a; color: #cdd6f4; border: solid #585b70; margin-bottom: 1; }
+    #list   { height: 7; color: #cdd6f4; margin-bottom: 1; }
+    #hint   { color: #6c7086; }
     """
+
     def __init__(self):
         super().__init__()
         self._results = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
-            yield Label("Search location")
-            yield Input(placeholder="City name, e.g. Hannover", id="inp")
-            yield ListView(id="results")
-            yield Label("Type city + Enter to search  •  Esc to cancel", id="hint")
+            yield Static("Search location", id="title")
+            yield Input(placeholder="City name  e.g. Hannover", id="inp")
+            yield Static("", id="list")
+            yield Static("Enter city name and press Enter", id="hint")
 
     def on_mount(self):
         self.query_one("#inp", Input).focus()
@@ -186,45 +185,35 @@ class SearchModal(ModalScreen):
         q = e.value.strip()
         if not q: return
         self.query_one("#hint").update("[#f9e2af]Searching…[/#f9e2af]")
-        self.query_one("#results", ListView).clear()
+        self.query_one("#list").update("")
         self._results = []
         threading.Thread(target=self._search, args=(q,), daemon=True).start()
 
     def _search(self, q):
         try:
-            self._results = geocode(q)
+            results = geocode(q)
         except Exception as exc:
-            self._results = []
-            self.call_from_thread(self._show_error, str(exc))
+            self.call_from_thread(self._show, [], f"[red]Error: {exc}[/red]")
             return
-        if not self._results:
-            self.call_from_thread(self._show_error, "No results found")
-            return
-        # call_from_thread auto-awaits AwaitComplete — must call clear/append
-        # individually so textual awaits each one (wrapping in a plain function
-        # discards the coroutine and silently does nothing)
-        lv = self.query_one("#results", ListView)
-        self.call_from_thread(lv.clear)
-        for r in self._results:
-            self.call_from_thread(lv.append, ListItem(Label(r["name"])))
-        self.call_from_thread(lv.focus)
-        self.call_from_thread(self.query_one("#hint").update,
-            "[#a6e3a1]↑↓ navigate  •  Enter to add  •  Esc to cancel[/#a6e3a1]")
+        self.call_from_thread(self._show, results,
+            "[#a6e3a1]Press 1–5 to add  •  Esc to cancel[/#a6e3a1]" if results
+            else "[red]No results found — try a different spelling[/red]")
 
-    def _show_error(self, msg):
-        self.query_one("#hint").update(f"[red]{msg}[/red]")
-
-    def on_list_view_selected(self, e: ListView.Selected):
-        all_items = list(self.query_one("#results", ListView).query(ListItem))
-        try:
-            idx = all_items.index(e.item)
-        except ValueError:
-            idx = self.query_one("#results", ListView).index
-        if idx is not None and 0 <= idx < len(self._results):
-            self.dismiss(self._results[idx])
+    def _show(self, results, hint):
+        self._results = results
+        lines = []
+        for i, r in enumerate(results[:5], 1):
+            lines.append(f" [bold #89b4fa]{i}[/bold #89b4fa]  {r['name']}")
+        self.query_one("#list").update("\n".join(lines))
+        self.query_one("#hint").update(hint)
 
     def on_key(self, e):
-        if e.key == "escape": self.dismiss(None)
+        if e.key == "escape":
+            self.dismiss(None)
+        elif e.key in ("1","2","3","4","5"):
+            idx = int(e.key) - 1
+            if idx < len(self._results):
+                self.dismiss(self._results[idx])
 
 
 # ── Main App ───────────────────────────────────────────────────────────────────
