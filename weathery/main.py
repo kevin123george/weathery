@@ -193,9 +193,9 @@ class SearchModal(ModalScreen):
         try:
             results = geocode(q)
         except Exception as exc:
-            self.call_from_thread(self._show, [], f"[red]Error: {exc}[/red]")
+            self.app.call_from_thread(self._show, [], f"[red]Error: {exc}[/red]")
             return
-        self.call_from_thread(self._show, results,
+        self.app.call_from_thread(self._show, results,
             "[#a6e3a1]Press 1–5 to add  •  Esc to cancel[/#a6e3a1]" if results
             else "[red]No results found — try a different spelling[/red]")
 
@@ -206,11 +206,13 @@ class SearchModal(ModalScreen):
             lines.append(f" [bold #89b4fa]{i}[/bold #89b4fa]  {r['name']}")
         self.query_one("#list").update("\n".join(lines))
         self.query_one("#hint").update(hint)
+        # Disable Input so it stops consuming keypresses — 1-5 will reach on_key
+        self.query_one("#inp", Input).disabled = True
 
     def on_key(self, e):
         if e.key == "escape":
             self.dismiss(None)
-        elif e.key in ("1","2","3","4","5"):
+        elif e.key in ("1","2","3","4","5") and self._results:
             idx = int(e.key) - 1
             if idx < len(self._results):
                 self.dismiss(self._results[idx])
@@ -241,11 +243,11 @@ class WeatherApp(App):
     """
 
     BINDINGS = [
-        Binding("q", "quit",         "Quit"),
-        Binding("a", "add_location", "Add"),
-        Binding("d", "del_location", "Del"),
-        Binding("r", "refresh",      "Refresh"),
-        Binding("u", "toggle_unit",  "°C/°F"),
+        Binding("q", "quit",         "Quit",     priority=True),
+        Binding("a", "add_location", "Add",      priority=True),
+        Binding("d", "del_location", "Del",      priority=True),
+        Binding("r", "refresh",      "Refresh",  priority=True),
+        Binding("u", "toggle_unit",  "°C/°F",   priority=True),
         Binding("j", "cursor_down",  "↓", show=False),
         Binding("k", "cursor_up",    "↑", show=False),
     ]
@@ -653,7 +655,7 @@ class WeatherApp(App):
             # Navigate to the new location immediately
             new_idx = len(self._locations) - 1
             self._cur_idx = new_idx
-            lv.move_cursor(row=new_idx)
+            lv.index = new_idx
             self._status(f"Added {loc['name']}, fetching…")
             threading.Thread(target=self._fetch_loc, args=(loc,), daemon=True).start()
         self.push_screen(SearchModal(), done)
