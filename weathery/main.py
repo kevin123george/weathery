@@ -204,8 +204,13 @@ class SearchModal(ModalScreen):
         self.query_one("#hint").update(f"[red]Error: {msg}[/red]")
 
     def on_list_view_selected(self, e: ListView.Selected):
-        idx = self.query_one("#results", ListView).index
-        if idx is not None and idx < len(self._results):
+        # Match selected item by reference, not by index (index can lag in textual 8)
+        all_items = list(self.query_one("#results", ListView).query(ListItem))
+        try:
+            idx = all_items.index(e.item)
+        except ValueError:
+            idx = self.query_one("#results", ListView).index
+        if idx is not None and 0 <= idx < len(self._results):
             self.dismiss(self._results[idx])
 
     def on_key(self, e):
@@ -644,8 +649,12 @@ class WeatherApp(App):
                 self._status(f"{loc['name']} already in list"); return
             self._locations.append(loc)
             _save(LOC_FILE, self._locations)
-            self.query_one("#loc-list", ListView).append(
-                ListItem(Label(loc["name"].split(",")[0][:18])))
+            lv = self.query_one("#loc-list", ListView)
+            lv.append(ListItem(Label(loc["name"].split(",")[0][:18])))
+            # Navigate to the new location immediately
+            new_idx = len(self._locations) - 1
+            self._cur_idx = new_idx
+            lv.move_cursor(row=new_idx)
             self._status(f"Added {loc['name']}, fetching…")
             threading.Thread(target=self._fetch_loc, args=(loc,), daemon=True).start()
         self.push_screen(SearchModal(), done)
