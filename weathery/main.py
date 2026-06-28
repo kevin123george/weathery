@@ -237,8 +237,9 @@ class WeatherApp(App):
     TabbedContent { height: 1fr; }
     TabPane { padding: 0 1; }
     DataTable { height: 1fr; }
-    #hourly-area { height: 1fr; }
-    #detail-sc   { height: 1fr; }
+    #hourly-area  { height: 1fr; }
+    #weekly-chart { height: 14; }
+    #detail-sc    { height: 1fr; }
     #status { height: 1; padding: 0 2; color: #585b70; }
     """
 
@@ -281,6 +282,7 @@ class WeatherApp(App):
                     with TabPane("Hourly", id="tab-hourly"):
                         yield Static("", id="hourly-area")
                     with TabPane("16-Day", id="tab-weekly"):
+                        yield Static("", id="weekly-chart")
                         yield DataTable(id="weekly-tbl", zebra_stripes=True)
                     with TabPane("Details", id="tab-details"):
                         with ScrollableContainer(id="detail-sc"):
@@ -491,50 +493,70 @@ class WeatherApp(App):
         )
 
     def _draw_hourly(self, data: dict):
-        h    = data.get("hourly", {})
+        h     = data.get("hourly", {})
         times = h.get("time", [])
         temps = h.get("temperature_2m", [])
         feels = h.get("apparent_temperature", [])
         probs = h.get("precipitation_probability", [])
-        precs = h.get("precipitation", [])
+        winds = h.get("wind_speed_10m", [])
 
         area = self.query_one("#hourly-area")
         if not times or not temps:
             area.update("No hourly data"); return
 
-        # Show next 24 hours
+        # Start from current hour, show 48h
         now_str = datetime.now().strftime("%Y-%m-%dT%H:00")
         start = 0
         for i, t in enumerate(times):
             if t >= now_str: start = i; break
+        end = min(start + 48, len(temps))
 
-        end   = min(start + 24, len(temps))
-        t_slice = temps[start:end]
-        p_slice = probs[start:end] if probs else [0]*24
-        times_s = [t[11:16] for t in times[start:end]]  # HH:MM
+        t_sl  = [v for v in temps[start:end] if v is not None]
+        f_sl  = [v for v in feels[start:end] if v is not None] if feels else []
+        p_sl  = [v or 0 for v in probs[start:end]] if probs else [0]*(end-start)
+        w_sl  = [v or 0 for v in winds[start:end]] if winds else [0]*(end-start)
+        ts    = times[start:end]
+        # Label every 6h; mark midnight with date
+        tick_i, tick_l = [], []
+        for i, t in enumerate(ts):
+            hh = int(t[11:13])
+            if hh % 6 == 0:
+                tick_i.append(i)
+                tick_l.append(t[5:10] + "\n00:00" if hh == 0 else t[11:16])
 
         try:
-            w = max(area.size.width  or 100, 60)
-            h_sz = max(area.size.height or 24, 14)
+            w    = max(area.size.width  or 100, 60)
+            h_sz = max(area.size.height or 30,  20)
+            xs   = list(range(len(t_sl)))
 
             plt.clf()
-            plt.subplots(2, 1)
+            plt.subplots(3, 1)
 
+            # ── Top: Temperature + Feels Like ──────────────────────────────
             plt.subplot(1, 1)
-            plt.plotsize(w, int(h_sz * 0.65))
-            plt.plot(t_slice, label=f"Temp ({self._deg()})")
-            if feels:
-                f_slice = feels[start:end]
-                plt.plot(f_slice, label="Feels like")
-            plt.title(f"24h Temperature  ({self._deg()})")
-            plt.xticks(list(range(0, len(times_s), 3)), times_s[::3])
+            plt.plotsize(w, int(h_sz * 0.50))
+            plt.plot(xs, t_sl, label=f"Temp {self._deg()}", color="red")
+            if f_sl:
+                plt.plot(xs[:len(f_sl)], f_sl,
+                         label=f"Feels like", color="blue")
+            plt.title(f"48h Forecast — {self._cur_loc['name'].split(',')[0]}")
+            plt.ylabel(self._deg())
+            plt.xticks(tick_i, tick_l)
 
+            # ── Middle: Precipitation probability ─────────────────────────
             plt.subplot(2, 1)
-            plt.plotsize(w, int(h_sz * 0.35))
-            plt.bar(list(range(len(p_slice))), p_slice)
-            plt.title("Precip Probability (%)")
-            plt.xticks(list(range(0, len(times_s), 3)), times_s[::3])
+            plt.plotsize(w, int(h_sz * 0.27))
+            plt.bar(xs[:len(p_sl)], p_sl, color="blue")
+            plt.title("Precip %")
             plt.ylim(0, 100)
+            plt.xticks(tick_i, tick_l)
+
+            # ── Bottom: Wind speed ─────────────────────────────────────────
+            plt.subplot(3, 1)
+            plt.plotsize(w, int(h_sz * 0.23))
+            plt.plot(xs[:len(w_sl)], w_sl, color="green")
+            plt.title(f"Wind ({self._speed()})")
+            plt.xticks(tick_i, tick_l)
 
             chart_str = _plt_build()
             area.update("\n".join(str(l) for l in _ansi.decode(chart_str)))
@@ -542,9 +564,7 @@ class WeatherApp(App):
             area.update(f"Chart error: {exc}")
 
     def _draw_weekly(self, data: dict):
-        d   = data.get("daily", {})
-        tbl = self.query_one("#weekly-tbl", DataTable)
-        tbl.clear()
+        d       = data.get("daily", {})
         dates   = d.get("time", [])
         codes   = d.get("weather_code", [])
         t_max   = d.get("temperature_2m_max", [])
@@ -554,22 +574,55 @@ class WeatherApp(App):
         wind    = d.get("wind_speed_10m_max", [])
         uv      = d.get("uv_index_max", [])
 
+        # ── High/Low temperature chart ─────────────────────────────────────
+        chart_area = self.query_one("#weekly-chart")
+        try:
+            if t_max and t_min:
+                hi_vals = [v for v in t_max if v is not None]
+                lo_vals = [v for v in t_min if v is not None]
+                n = min(len(hi_vals), len(lo_vals), len(dates))
+                xs = list(range(n))
+                labels = []
+                today  = datetime.now().strftime("%Y-%m-%d")
+                for date in dates[:n]:
+                    try:
+                        dt = datetime.strptime(date, "%Y-%m-%d")
+                        labels.append("Today" if date == today else dt.strftime("%d %b"))
+                    except:
+                        labels.append(date[5:])
+                w    = max(chart_area.size.width  or 100, 60)
+                h_sz = max(chart_area.size.height or 14,  10)
+                plt.clf()
+                plt.plotsize(w, h_sz)
+                plt.plot(xs, hi_vals, label=f"High {self._deg()}", color="red")
+                plt.plot(xs, lo_vals, label=f"Low {self._deg()}",  color="blue")
+                plt.title(f"16-Day Temperature Range ({self._deg()})")
+                plt.xticks(xs, labels)
+                chart_str = _plt_build()
+                chart_area.update("\n".join(str(l) for l in _ansi.decode(chart_str)))
+        except Exception as exc:
+            chart_area.update(f"Chart error: {exc}")
+
+        # ── Table ──────────────────────────────────────────────────────────
+        tbl = self.query_one("#weekly-tbl", DataTable)
+        tbl.clear()
         today = datetime.now().strftime("%Y-%m-%d")
         for i, date in enumerate(dates):
             try:
-                dt = datetime.strptime(date, "%Y-%m-%d")
+                dt  = datetime.strptime(date, "%Y-%m-%d")
                 day = "Today" if date == today else dt.strftime("%a %d %b")
-            except: day = date
+            except:
+                day = date
             code  = codes[i] if i < len(codes) else 0
             desc, _ = _wmo_label(code)
-            hi  = self._fmt_temp(t_max[i])  if i < len(t_max)  else "N/A"
-            lo  = self._fmt_temp(t_min[i])  if i < len(t_min)  else "N/A"
-            rp  = f"{r_prob[i]:.0f}%"       if i < len(r_prob) and r_prob[i] is not None else "N/A"
-            rs  = f"{float(r_sum[i]):.1f}mm" if i < len(r_sum) and r_sum[i] is not None  else "0mm"
+            hi  = self._fmt_temp(t_max[i])   if i < len(t_max)  else "N/A"
+            lo  = self._fmt_temp(t_min[i])   if i < len(t_min)  else "N/A"
+            rp  = f"{r_prob[i]:.0f}%"        if i < len(r_prob) and r_prob[i] is not None else "N/A"
+            rs  = f"{float(r_sum[i]):.1f}mm" if i < len(r_sum)  and r_sum[i]  is not None else "0mm"
             ws  = f"{float(wind[i]):.0f} {self._speed()}" if i < len(wind) and wind[i] is not None else "N/A"
-            uv_v = float(uv[i]) if i < len(uv) and uv[i] is not None else 0
+            uv_v   = float(uv[i]) if i < len(uv) and uv[i] is not None else 0
             uv_clr = "green" if uv_v < 3 else "yellow" if uv_v < 6 else "red"
-            uv_s = f"[{uv_clr}]{uv_v:.0f}[/{uv_clr}]"
+            uv_s   = f"[{uv_clr}]{uv_v:.0f}[/{uv_clr}]"
             tbl.add_row(day, desc, hi, lo, rp, rs, ws, uv_s)
 
     def _draw_details(self, data: dict):
@@ -640,7 +693,9 @@ class WeatherApp(App):
 
     def on_resize(self, _):
         data = self._weather.get(self._cur_loc["name"])
-        if data: self._draw_hourly(data)
+        if data:
+            self._draw_hourly(data)
+            self._draw_weekly(data)
 
     # ── Actions ────────────────────────────────────────────────────────────────
     def action_add_location(self):
