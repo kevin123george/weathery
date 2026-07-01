@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """weathery — terminal weather forecast TUI"""
 
-import sys, threading, json, time, io
+import sys, threading, json, time, io, os, base64
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen
 from urllib.parse import urlencode
 from urllib.error import URLError
 from rich.ansi import AnsiDecoder
+from rich.segment import Segment
 
 import plotext as plt
 from textual.app import App, ComposeResult
@@ -16,11 +17,11 @@ from textual.widgets import (
     Footer, Header, Input, DataTable,
     TabbedContent, TabPane, Button,
 )
+from textual.widget import Widget
+from textual.strip import Strip
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.binding import Binding
 from textual.screen import ModalScreen
-
-_ansi = AnsiDecoder()
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DATA_DIR = Path.home() / ".weathery"
@@ -155,6 +156,220 @@ def _plt_build():
         plt.show(); _sys.stdout = old
         return buf.getvalue()
 
+_ansi = AnsiDecoder()
+
+def _kitty_supported():
+    return os.environ.get("TERM_PROGRAM", "") in ("ghostty", "kitty") \
+        or "KITTY_WINDOW_ID" in os.environ
+
+def _make_hourly_chart(ts, t_sl, f_sl, p_sl, w_sl, loc_name, deg, speed_unit):
+    """48-hour 3-panel chart: temp+feels / precip / wind → PNG bytes."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as mplt
+        import matplotlib.gridspec as gridspec
+    except ImportError:
+        return None
+
+    bg, panel, grid = "#1e1e2e", "#181825", "#313244"
+    xs = list(range(len(t_sl)))
+
+    # x-axis tick labels every 6 hours
+    tick_pos, tick_lbl = [], []
+    for i, t in enumerate(ts[:len(t_sl)]):
+        hh = int(t[11:13]) if len(t) > 13 else 0
+        if hh % 6 == 0:
+            tick_pos.append(i)
+            tick_lbl.append((t[5:10] + "\n00:00") if hh == 0 else t[11:16])
+
+    fig = mplt.figure(figsize=(16, 9), facecolor=bg)
+    gs  = gridspec.GridSpec(3, 1, figure=fig,
+                            height_ratios=[4, 2, 2], hspace=0.08)
+    ax_t = fig.add_subplot(gs[0])
+    ax_p = fig.add_subplot(gs[1], sharex=ax_t)
+    ax_w = fig.add_subplot(gs[2], sharex=ax_t)
+
+    def _style(ax):
+        ax.set_facecolor(panel)
+        ax.tick_params(colors="#6c7086", labelsize=8)
+        for spine in ax.spines.values(): spine.set_color(grid)
+        ax.grid(color=grid, linewidth=0.5, alpha=0.6)
+
+    for ax in (ax_t, ax_p, ax_w): _style(ax)
+
+    # Temperature panel
+    ax_t.plot(xs, t_sl, color="#f38ba8", linewidth=1.8, label=f"Temp {deg}")
+    ax_t.fill_between(xs, t_sl, min(t_sl) - 1, alpha=0.12, color="#f38ba8")
+    if f_sl:
+        n = min(len(f_sl), len(xs))
+        ax_t.plot(xs[:n], f_sl[:n], color="#89b4fa", linewidth=1.4,
+                  linestyle="--", label="Feels like")
+    ax_t.set_title(f"  48h Forecast — {loc_name.split(',')[0]}",
+                   color="#cdd6f4", fontsize=11, fontweight="bold", loc="left", pad=6)
+    ax_t.set_ylabel(deg, color="#6c7086", fontsize=8)
+    ax_t.legend(facecolor=panel, edgecolor=grid, labelcolor="#cdd6f4",
+                fontsize=8, loc="upper right")
+    ax_t.set_xticks(tick_pos); ax_t.set_xticklabels([])
+
+    # Precipitation panel
+    precip_clrs = ["#89b4fa" if v < 40 else "#cba6f7" if v < 70 else "#f38ba8"
+                   for v in p_sl]
+    ax_p.bar(xs[:len(p_sl)], p_sl[:len(xs)],
+             color=precip_clrs, alpha=0.85, width=0.85)
+    ax_p.set_ylim(0, 105)
+    ax_p.set_ylabel("Precip %", color="#6c7086", fontsize=8)
+    ax_p.axhline(50, color=grid, linewidth=0.7, linestyle="--")
+    ax_p.set_xticks(tick_pos); ax_p.set_xticklabels([])
+
+    # Wind panel
+    ax_w.plot(xs[:len(w_sl)], w_sl[:len(xs)],
+              color="#a6e3a1", linewidth=1.6)
+    ax_w.fill_between(xs[:len(w_sl)], w_sl[:len(xs)], 0,
+                      alpha=0.15, color="#a6e3a1")
+    ax_w.set_ylabel(f"Wind\n{speed_unit}", color="#6c7086", fontsize=7)
+    ax_w.set_xticks(tick_pos)
+    ax_w.set_xticklabels(tick_lbl, color="#6c7086", fontsize=7)
+
+    for ax in (ax_t, ax_p, ax_w):
+        ax.yaxis.set_tick_params(labelcolor="#6c7086")
+
+    fig.tight_layout(pad=0.5)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    mplt.close(fig)
+    return buf.getvalue()
+
+def _make_weekly_chart(dates, hi_vals, lo_vals, deg):
+    """16-day hi/lo temperature chart → PNG bytes."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as mplt
+    except ImportError:
+        return None
+
+    bg, panel, grid = "#1e1e2e", "#181825", "#313244"
+    today = datetime.now().strftime("%Y-%m-%d")
+    n     = min(len(hi_vals), len(lo_vals), len(dates))
+    xs    = list(range(n))
+    labels = []
+    for d in dates[:n]:
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d")
+            labels.append("Today" if d == today else dt.strftime("%d %b"))
+        except:
+            labels.append(d[5:])
+
+    fig, ax = mplt.subplots(figsize=(16, 4), facecolor=bg)
+    ax.set_facecolor(panel)
+    for spine in ax.spines.values(): spine.set_color(grid)
+    ax.grid(color=grid, linewidth=0.5, alpha=0.6)
+    ax.tick_params(colors="#6c7086", labelsize=8)
+
+    ax.plot(xs, hi_vals[:n], color="#f38ba8", linewidth=2.0,
+            marker="o", markersize=4, label=f"High {deg}")
+    ax.plot(xs, lo_vals[:n], color="#89b4fa", linewidth=2.0,
+            marker="o", markersize=4, label=f"Low {deg}")
+    ax.fill_between(xs, lo_vals[:n], hi_vals[:n],
+                    alpha=0.12, color="#cba6f7")
+
+    # Annotate every other point
+    for i in range(0, n, 2):
+        ax.annotate(f"{hi_vals[i]:.0f}°",
+                    (i, hi_vals[i]), textcoords="offset points",
+                    xytext=(0, 6), ha="center", color="#f38ba8", fontsize=7)
+        ax.annotate(f"{lo_vals[i]:.0f}°",
+                    (i, lo_vals[i]), textcoords="offset points",
+                    xytext=(0, -12), ha="center", color="#89b4fa", fontsize=7)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(labels, rotation=25, ha="right",
+                       color="#6c7086", fontsize=8)
+    ax.set_ylabel(deg, color="#6c7086", fontsize=8)
+    ax.set_title(f"  16-Day Temperature Range ({deg})",
+                 color="#cdd6f4", fontsize=10, fontweight="bold", loc="left", pad=6)
+    ax.legend(facecolor=panel, edgecolor=grid, labelcolor="#cdd6f4",
+              fontsize=8, loc="upper right")
+    ax.yaxis.set_tick_params(labelcolor="#6c7086")
+
+    fig.tight_layout(pad=0.5)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    mplt.close(fig)
+    return buf.getvalue()
+
+
+# ── Chart widget (Kitty graphics + plotext fallback) ───────────────────────────
+class ChartWidget(Widget):
+    """Renders matplotlib PNG via Kitty protocol or plotext ANSI text."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._png: bytes | None = None
+        self._kitty_seq: str    = ""
+        self._ansi_lines: list  = []
+
+    def set_png(self, png: bytes):
+        self._png        = png
+        self._ansi_lines = []
+        self._kitty_seq  = self._encode(png)
+        self.refresh()
+
+    def set_plotext(self, text: str):
+        self._png        = None
+        self._kitty_seq  = ""
+        self._ansi_lines = list(_ansi.decode(text)) if text else []
+        self.refresh()
+
+    def _encode(self, png: bytes) -> str:
+        w = max(self.size.width,  1)
+        h = max(self.size.height, 1)
+        data   = base64.standard_b64encode(png).decode()
+        chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+        parts  = []
+        for i, c in enumerate(chunks):
+            m = 0 if i == len(chunks) - 1 else 1
+            if i == 0:
+                parts.append(f"\x1b_Ga=T,f=100,c={w},r={h},m={m},q=2;{c}\x1b\\")
+            else:
+                parts.append(f"\x1b_Gm={m},q=2;{c}\x1b\\")
+        return "".join(parts)
+
+    def render_line(self, y: int) -> Strip:
+        w  = max(self.size.width, 1)
+        bg = Segment(" " * w)
+        if self._kitty_seq:
+            if y == 0:
+                return Strip([Segment(self._kitty_seq, None, True), bg])
+            return Strip([bg])
+        if self._ansi_lines and y < len(self._ansi_lines):
+            try:
+                return Strip.from_rich_text(self._ansi_lines[y], cell_length=w)
+            except Exception:
+                pass
+        return Strip([bg])
+
+    def on_resize(self, _):
+        if self._png:
+            self._kitty_seq = self._encode(self._png)
+        self.refresh()
+
+    def on_hide(self):
+        if self._kitty_seq:
+            try:
+                os.write(sys.stdout.fileno(), b"\x1b_Ga=d,d=A,q=2\x1b\\")
+            except Exception:
+                pass
+
+    def on_show(self):
+        if self._png:
+            self._kitty_seq = self._encode(self._png)
+            self.refresh()
+
+
 # ── Modals ─────────────────────────────────────────────────────────────────────
 class SearchModal(ModalScreen):
     """Two-step modal: type city → Enter to search → press 1-5 to pick result."""
@@ -238,7 +453,7 @@ class WeatherApp(App):
     TabPane { padding: 0 1; }
     DataTable { height: 1fr; }
     #hourly-area  { height: 1fr; }
-    #weekly-chart { height: 14; }
+    #weekly-chart { height: 18; }
     #detail-sc    { height: 1fr; }
     #status { height: 1; padding: 0 2; color: #585b70; }
     """
@@ -280,9 +495,9 @@ class WeatherApp(App):
                     with TabPane("Now", id="tab-now"):
                         yield Static("", id="now-content")
                     with TabPane("Hourly", id="tab-hourly"):
-                        yield Static("", id="hourly-area")
+                        yield ChartWidget(id="hourly-area")
                     with TabPane("16-Day", id="tab-weekly"):
-                        yield Static("", id="weekly-chart")
+                        yield ChartWidget(id="weekly-chart")
                         yield DataTable(id="weekly-tbl", zebra_stripes=True)
                     with TabPane("Details", id="tab-details"):
                         with ScrollableContainer(id="detail-sc"):
@@ -492,6 +707,12 @@ class WeatherApp(App):
             f"   {'Condition':<{R}}{desc}\n"
         )
 
+    def _set_hourly_png(self, png):
+        self.query_one("#hourly-area", ChartWidget).set_png(png)
+
+    def _set_weekly_png(self, png):
+        self.query_one("#weekly-chart", ChartWidget).set_png(png)
+
     def _draw_hourly(self, data: dict):
         h     = data.get("hourly", {})
         times = h.get("time", [])
@@ -500,68 +721,56 @@ class WeatherApp(App):
         probs = h.get("precipitation_probability", [])
         winds = h.get("wind_speed_10m", [])
 
-        area = self.query_one("#hourly-area")
+        area = self.query_one("#hourly-area", ChartWidget)
         if not times or not temps:
-            area.update("No hourly data"); return
+            area.set_plotext("No hourly data"); return
 
-        # Start from current hour, show 48h
         now_str = datetime.now().strftime("%Y-%m-%dT%H:00")
         start = 0
         for i, t in enumerate(times):
             if t >= now_str: start = i; break
         end = min(start + 48, len(temps))
 
-        t_sl  = [v for v in temps[start:end] if v is not None]
-        f_sl  = [v for v in feels[start:end] if v is not None] if feels else []
-        p_sl  = [v or 0 for v in probs[start:end]] if probs else [0]*(end-start)
-        w_sl  = [v or 0 for v in winds[start:end]] if winds else [0]*(end-start)
-        ts    = times[start:end]
-        # Label every 6h; mark midnight with date
-        tick_i, tick_l = [], []
-        for i, t in enumerate(ts):
-            hh = int(t[11:13])
-            if hh % 6 == 0:
-                tick_i.append(i)
-                tick_l.append(t[5:10] + "\n00:00" if hh == 0 else t[11:16])
+        t_sl = [v for v in temps[start:end] if v is not None]
+        f_sl = [v for v in feels[start:end] if v is not None] if feels else []
+        p_sl = [v or 0 for v in probs[start:end]] if probs else [0]*(end-start)
+        w_sl = [v or 0 for v in winds[start:end]] if winds else [0]*(end-start)
+        ts   = times[start:end]
 
+        if _kitty_supported():
+            png = _make_hourly_chart(ts, t_sl, f_sl, p_sl, w_sl,
+                                     self._cur_loc["name"],
+                                     self._deg(), self._speed())
+            if png:
+                area.set_png(png); return
+
+        # plotext fallback
         try:
+            tick_i, tick_l = [], []
+            for i, t in enumerate(ts):
+                hh = int(t[11:13])
+                if hh % 6 == 0:
+                    tick_i.append(i)
+                    tick_l.append(t[5:10] + "\n00:00" if hh == 0 else t[11:16])
             w    = max(area.size.width  or 100, 60)
             h_sz = max(area.size.height or 30,  20)
             xs   = list(range(len(t_sl)))
-
-            plt.clf()
-            plt.subplots(3, 1)
-
-            # ── Top: Temperature + Feels Like ──────────────────────────────
-            plt.subplot(1, 1)
-            plt.plotsize(w, int(h_sz * 0.50))
+            plt.clf(); plt.subplots(3, 1)
+            plt.subplot(1, 1); plt.plotsize(w, int(h_sz * 0.50))
             plt.plot(xs, t_sl, label=f"Temp {self._deg()}", color="red")
-            if f_sl:
-                plt.plot(xs[:len(f_sl)], f_sl,
-                         label=f"Feels like", color="blue")
-            plt.title(f"48h Forecast — {self._cur_loc['name'].split(',')[0]}")
-            plt.ylabel(self._deg())
+            if f_sl: plt.plot(xs[:len(f_sl)], f_sl, label="Feels", color="blue")
+            plt.title(f"48h — {self._cur_loc['name'].split(',')[0]}")
             plt.xticks(tick_i, tick_l)
-
-            # ── Middle: Precipitation probability ─────────────────────────
-            plt.subplot(2, 1)
-            plt.plotsize(w, int(h_sz * 0.27))
+            plt.subplot(2, 1); plt.plotsize(w, int(h_sz * 0.27))
             plt.bar(xs[:len(p_sl)], p_sl, color="blue")
-            plt.title("Precip %")
-            plt.ylim(0, 100)
-            plt.xticks(tick_i, tick_l)
-
-            # ── Bottom: Wind speed ─────────────────────────────────────────
-            plt.subplot(3, 1)
-            plt.plotsize(w, int(h_sz * 0.23))
+            plt.title("Precip %"); plt.ylim(0, 100); plt.xticks(tick_i, tick_l)
+            plt.subplot(3, 1); plt.plotsize(w, int(h_sz * 0.23))
             plt.plot(xs[:len(w_sl)], w_sl, color="green")
-            plt.title(f"Wind ({self._speed()})")
-            plt.xticks(tick_i, tick_l)
-
+            plt.title(f"Wind ({self._speed()})"); plt.xticks(tick_i, tick_l)
             chart_str = _plt_build()
-            area.update("\n".join(str(l) for l in _ansi.decode(chart_str)))
+            area.set_plotext("\n".join(str(l) for l in _ansi.decode(chart_str)))
         except Exception as exc:
-            area.update(f"Chart error: {exc}")
+            area.set_plotext(f"Chart error: {exc}")
 
     def _draw_weekly(self, data: dict):
         d       = data.get("daily", {})
@@ -575,33 +784,36 @@ class WeatherApp(App):
         uv      = d.get("uv_index_max", [])
 
         # ── High/Low temperature chart ─────────────────────────────────────
-        chart_area = self.query_one("#weekly-chart")
+        chart_area = self.query_one("#weekly-chart", ChartWidget)
         try:
             if t_max and t_min:
                 hi_vals = [v for v in t_max if v is not None]
                 lo_vals = [v for v in t_min if v is not None]
-                n = min(len(hi_vals), len(lo_vals), len(dates))
-                xs = list(range(n))
-                labels = []
-                today  = datetime.now().strftime("%Y-%m-%d")
-                for date in dates[:n]:
-                    try:
-                        dt = datetime.strptime(date, "%Y-%m-%d")
-                        labels.append("Today" if date == today else dt.strftime("%d %b"))
-                    except:
-                        labels.append(date[5:])
-                w    = max(chart_area.size.width  or 100, 60)
-                h_sz = max(chart_area.size.height or 14,  10)
-                plt.clf()
-                plt.plotsize(w, h_sz)
-                plt.plot(xs, hi_vals, label=f"High {self._deg()}", color="red")
-                plt.plot(xs, lo_vals, label=f"Low {self._deg()}",  color="blue")
-                plt.title(f"16-Day Temperature Range ({self._deg()})")
-                plt.xticks(xs, labels)
-                chart_str = _plt_build()
-                chart_area.update("\n".join(str(l) for l in _ansi.decode(chart_str)))
+                if _kitty_supported():
+                    png = _make_weekly_chart(dates, hi_vals, lo_vals, self._deg())
+                    if png:
+                        chart_area.set_png(png)
+                else:
+                    n = min(len(hi_vals), len(lo_vals), len(dates))
+                    xs = list(range(n)); labels = []
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    for date in dates[:n]:
+                        try:
+                            dt = datetime.strptime(date, "%Y-%m-%d")
+                            labels.append("Today" if date == today else dt.strftime("%d %b"))
+                        except: labels.append(date[5:])
+                    w    = max(chart_area.size.width  or 100, 60)
+                    h_sz = max(chart_area.size.height or 14,  10)
+                    plt.clf(); plt.plotsize(w, h_sz)
+                    plt.plot(xs, hi_vals, label=f"High {self._deg()}", color="red")
+                    plt.plot(xs, lo_vals, label=f"Low {self._deg()}",  color="blue")
+                    plt.title(f"16-Day Temperature Range ({self._deg()})")
+                    plt.xticks(xs, labels)
+                    chart_str = _plt_build()
+                    chart_area.set_plotext(
+                        "\n".join(str(l) for l in _ansi.decode(chart_str)))
         except Exception as exc:
-            chart_area.update(f"Chart error: {exc}")
+            chart_area.set_plotext(f"Chart error: {exc}")
 
         # ── Table ──────────────────────────────────────────────────────────
         tbl = self.query_one("#weekly-tbl", DataTable)
